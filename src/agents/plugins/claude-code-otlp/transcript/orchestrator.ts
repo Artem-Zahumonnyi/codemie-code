@@ -59,6 +59,7 @@ import {
   extractNamedInvocations,
   extractOrderedNamedInvocations,
 } from '@/agents/plugins/claude/session/claude-named-invocations.js';
+import { isCountedTranscriptLine, keepFirstByUuid } from '@/agents/plugins/claude/session/transcript-lines.js';
 import {
   buildCompactionDoneEvent,
   collectClientVersions,
@@ -359,15 +360,16 @@ async function buildFullAccumulator(transcriptPath: string): Promise<{
   }
 
   const rawLines = raw.split('\n').filter((line) => line.trim().length > 0);
-  const parsedLines: TranscriptLine[] = [];
+  const allLines: TranscriptLine[] = [];
 
   for (const line of rawLines) {
     try {
-      parsedLines.push(JSON.parse(line) as TranscriptLine);
+      allLines.push(JSON.parse(line) as TranscriptLine);
     } catch {
       // Skip malformed lines rather than aborting the whole scan.
     }
   }
+  const parsedLines = keepFirstByUuid(allLines.filter(isCountedTranscriptLine));
 
   // Pass 1: collect tool_result error flags keyed by their matching tool_use_id.
   const errorByToolUseId = collectErrorToolUseIds(parsedLines);
@@ -438,6 +440,36 @@ async function buildFullAccumulator(transcriptPath: string): Promise<{
 }
 
 /**
+ * The seen-uuid set for a state saved before `seenMessageUuids` existed: the counted `user` /
+ * `assistant` uuids in the bytes the earlier pass already read, so their re-written copies are not
+ * counted again. A file now shorter than `mainOffset` seeds nothing: the reader re-reads it from
+ * byte 0 as new lines never counted. `null` when the file is missing or unreadable, so the caller
+ * leaves the field absent and the next pass seeds again.
+ */
+async function seedSeenUuids(transcriptPath: string, mainOffset: number): Promise<Set<string> | null> {
+  const seen = new Set<string>();
+  if (mainOffset <= 0) return seen;
+  let buffer: Buffer;
+  try {
+    buffer = await readFile(transcriptPath);
+  } catch {
+    return null;
+  }
+  if (buffer.length < mainOffset) return seen;
+  const head = buffer.subarray(0, mainOffset);
+  for (const line of head.toString('utf-8').split('\n')) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (isCountedTranscriptLine(parsed)) keepFirstByUuid([parsed], seen);
+  }
+  return seen;
+}
+
+/**
  * Derive the spool-bound events for one `Stop`/`PreCompact`/`PostCompact`/`SessionEnd`/
  * `StopFailure` hook fire, mutating `state` in memory. Does not persist anything — the caller (a
  * pass opener below) owns the commit, so several passes can share one in-memory `state` under
@@ -453,15 +485,19 @@ async function buildFullAccumulator(transcriptPath: string): Promise<{
  *   recompute (see {@link buildFullAccumulator}). `PreCompact`/`StopFailure` never return a
  *   summary.
  *
- * Scoping: `state.activeSkill` tracks which skill (if any) the main transcript is currently
- * "inside" — set to a skill's name when a `Skill` tool_use invokes it ({@link findSkillInvocation},
- * applied *after* scoping that same line's own usage record, since the invoking turn itself still
- * belongs to whatever was active before it), and cleared on the next genuine new user turn
- * ({@link isGenuineUserTurn}) — a fresh prompt is treated as leaving any skill context the
- * previous turn's work was under. Every usage record is scoped `scopeKind: 'skill'`,
- * `scopeName: state.activeSkill` while a skill is active, else `scopeKind: 'main'`, `scopeName: ''`.
- * This is a heuristic, not a tracked boundary Claude Code itself reports — a skill whose work
- * spans multiple turns without an intervening user prompt is scoped as one continuous span.
+ * Scoping: Claude Code's own mark decides first. A line with `attributionSkill` (2.1.278+, set on
+ * every line an inline skill — run as `/x` or through the `Skill` tool — or a command owns) is
+ * scoped `scopeKind: 'skill'`, `scopeName: <attributionSkill>`; a line without it that has
+ * `requestedModel` (2.1.295+, which would carry the mark if a skill owned it) is `scopeKind: 'main'`,
+ * `scopeName: ''`. Only a line with neither falls back to the `state.activeSkill` heuristic:
+ * `state.activeSkill` tracks which skill (if any) the main transcript is currently "inside" — set to
+ * a skill's name when a `Skill` tool_use invokes it ({@link findSkillInvocation}, applied *after*
+ * scoping that same line's own usage record, since the invoking turn itself still belongs to
+ * whatever was active before it), and cleared on the next genuine new user turn
+ * ({@link isGenuineUserTurn}). Such a line is scoped `scopeKind: 'skill'`,
+ * `scopeName: state.activeSkill` while a skill is active, else `main`. The heuristic misses a
+ * slash-invoked skill or command and scopes a skill whose work spans several turns without an
+ * intervening user prompt as one continuous span.
  */
 async function deriveMainEvents(
   state: TranscriptParseState,
@@ -473,6 +509,10 @@ async function deriveMainEvents(
 
   const events: Record<string, unknown>[] = [];
   const touchedKeys = new Set<string>();
+  const seeded = Array.isArray(state.seenMessageUuids)
+    ? new Set<string>(state.seenMessageUuids)
+    : await seedSeenUuids(transcriptPath, state.mainOffset);
+  const seenUuids = seeded ?? new Set<string>();
   for (const line of lines) {
     let rawGitBranch = '';
     let isUserLine = false;
@@ -485,6 +525,9 @@ async function deriveMainEvents(
       // Malformed line: still attempt usage parsing below (which has its own try/catch), but
       // there is no branch/skill/turn signal to read from it.
     }
+    if (!isCountedTranscriptLine(head) || keepFirstByUuid([head], seenUuids).length === 0) {
+      continue;
+    }
     // The contract's branch counts are user lines per branch.
     if (rawGitBranch && isUserLine) {
       updateBranchCounts(state.branchCounts, rawGitBranch);
@@ -494,9 +537,10 @@ async function deriveMainEvents(
       state.activeSkill = '';
     }
 
-    const scopeKind = state.activeSkill ? 'skill' : 'main';
-    const parsed = parseUsageLine(line, scopeKind, state.activeSkill, '', '');
+    const parsed = parseUsageLine(line, 'main', '', '', '');
     if (parsed) {
+      parsed.scopeName = parsed.attributionSkill || (parsed.requestedModel ? '' : state.activeSkill);
+      parsed.scopeKind = parsed.scopeName ? 'skill' : 'main';
       const key = usageRequestKey(parsed);
       const existing = state.openRequests[key];
       state.openRequests[key] = existing ? mergeUsageRequest(existing, parsed) : parsed;
@@ -513,6 +557,7 @@ async function deriveMainEvents(
     }
   }
   state.mainOffset = nextOffset;
+  if (seeded) state.seenMessageUuids = [...seenUuids];
 
   for (const key of touchedKeys) {
     events.push(buildUsageRequestEvent(sessionId, state.openRequests[key]));
@@ -665,26 +710,37 @@ export interface SessionEnvCheckResult {
 const NOOP_FINALIZE = async (): Promise<void> => {};
 
 /**
- * Most recent non-empty, non-`<synthetic>` `model` among main-thread and skill usage requests
- * parsed so far for this session. Used as a last-resort fallback for `configured_model` when
- * neither the triggering hook's own payload nor the prior `agent.session.env` snapshot has one —
- * e.g. the Claude Code desktop app's `SessionStart` carries no `model` until the first `/compact`
- * or model switch, even though every transcript line already reports the model that actually
- * answered. Subagent requests share `state.openRequests` but must not set the session's model.
- * `''` when no request has a usable model yet (true at the very first hook of a session, before
- * any transcript line exists).
+ * The model of the newest request parsed so far for this session that sets the session's model:
+ * its `requestedModel`, else its `model`. Used as a last-resort fallback for `configured_model`
+ * when neither the triggering hook's own payload nor the prior `agent.session.env` snapshot has
+ * one — e.g. the Claude Code desktop app's `SessionStart` carries no `model` until the first
+ * `/compact` or model switch, even though every transcript line already reports the model that
+ * actually answered. A request counts when it has an empty `agentId` and a non-empty,
+ * non-`<synthetic>` `model`, and is either scoped `main` or scoped `skill` with neither
+ * `attributionSkill` nor `requestedModel`. A fork never counts (its `agentId`), on any version. A
+ * line Claude Code marked with `attributionSkill` (2.1.278+) never counts: an inline skill or a
+ * command can run on its own `model:`. An unmarked line without `requestedModel` (before 2.1.295)
+ * counts whatever its scope — the `activeSkill` heuristic may have scoped it `skill`, but nothing
+ * on the line says a skill owned it, so the fallback reads it as it always has.
+ * `requestedModel` is preferred because it has the form SessionStart `model` and the model-switch
+ * hooks use (`claude-opus-5-5[1m]`), while `model` drops `[1m]` and can be the provider's id.
+ * `''` when no such request exists yet.
  */
 function latestKnownModel(openRequests: Record<string, OpenUsageRequest>): string {
   let best: OpenUsageRequest | undefined;
   for (const req of Object.values(openRequests)) {
-    if ((req.scopeKind !== 'main' && req.scopeKind !== 'skill') || !req.model || isSyntheticModel(req.model)) {
+    if (req.agentId || !req.model || isSyntheticModel(req.model)) {
+      continue;
+    }
+    const unmarkedSkill = req.scopeKind === 'skill' && !req.attributionSkill && !req.requestedModel;
+    if (req.scopeKind !== 'main' && !unmarkedSkill) {
       continue;
     }
     if (!best || req.timestamp > best.timestamp) {
       best = req;
     }
   }
-  return best?.model ?? '';
+  return best ? best.requestedModel || best.model : '';
 }
 
 /**
@@ -937,14 +993,15 @@ async function scanSubagentTranscript(filePath: string): Promise<SubagentScanRes
   }
 
   const rawLines = raw.split('\n').filter((line) => line.trim().length > 0);
-  const parsedLines: TranscriptLine[] = [];
+  const allLines: TranscriptLine[] = [];
   for (const line of rawLines) {
     try {
-      parsedLines.push(JSON.parse(line) as TranscriptLine);
+      allLines.push(JSON.parse(line) as TranscriptLine);
     } catch {
       // Skip malformed lines rather than aborting the whole scan.
     }
   }
+  const parsedLines = keepFirstByUuid(allLines.filter(isCountedTranscriptLine));
 
   if (parsedLines.length === 0) {
     return empty;

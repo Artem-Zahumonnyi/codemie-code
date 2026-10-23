@@ -40,6 +40,12 @@ export interface OpenUsageRequest {
   stopReason: string;
   isApiError: boolean;
   gitBranch: string;
+  /** The line's `requestedModel` (Claude Code 2.1.295+), in the form SessionStart `model` and the
+   *  model-switch hooks use; `''` when the line has none; absent in a record saved before it existed. */
+  requestedModel?: string;
+  /** The line's `attributionSkill` — the skill or command Claude Code attributes the request to;
+   *  `''` when the line has none; absent in a record saved before it existed. */
+  attributionSkill?: string;
 }
 
 export interface TranscriptParseState {
@@ -56,6 +62,10 @@ export interface TranscriptParseState {
    *  `compact_boundary` lines independently of `mainOffset`, since a sibling hook can advance
    *  `mainOffset` past one without ever looking for it. */
   lastCompactionEnd: string;
+  /** `uuid`s of the main transcript's `user` / `assistant` lines already counted, so a re-written
+   *  copy in later bytes is skipped. An array, not a `Set`, so it survives the JSON save; absent in
+   *  a state saved before it existed. */
+  seenMessageUuids?: string[];
 }
 
 /**
