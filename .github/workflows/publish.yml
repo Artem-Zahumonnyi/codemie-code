@@ -10,10 +10,15 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: read
+
 jobs:
   publish:
     name: Publish Package
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     environment: prod
     env:
       ARTIFACTORY_INSTALL_URL: ${{ secrets.ARTIFACTORY_INSTALL_URL }}
