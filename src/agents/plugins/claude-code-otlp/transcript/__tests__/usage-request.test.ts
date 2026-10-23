@@ -78,7 +78,7 @@ describe('parseUsageLine', () => {
     // Nested usage.output_tokens_details.thinking_tokens.
     expect(r.thinkingTokens).toBe(28);
     expect(r.cacheReadTokens).toBe(40);
-    // Nested cache_creation.* fields, not the flat cache_creation_input_tokens.
+    // Nested cache_creation.* priority over the flat cache_creation_input_tokens aggregate.
     expect(r.cacheCreation5mTokens).toBe(5);
     expect(r.cacheCreation1hTokens).toBe(10);
     // Nested server_tool_use.* fields.
@@ -87,11 +87,86 @@ describe('parseUsageLine', () => {
     // stop_reason is a sibling of usage on message, not nested inside usage.
     expect(r.stopReason).toBe('end_turn');
     expect(r.gitBranch).toBe('feature/epmcdme-15301');
-    // No documented source field for isApiError on a real transcript line — defaults false.
+    // Normal transcript lines without isApiErrorMessage default to false.
     expect(r.isApiError).toBe(false);
     expect(r.scopeKind).toBe('main');
     expect(r.scopeName).toBe('');
     expect(r.agentId).toBe('');
+  });
+
+  it('falls back to the flat cache_creation_input_tokens as the 5m tier when the row has no cache_creation split', () => {
+    const line = JSON.stringify({
+      requestId: 'req_flat_only',
+      message: {
+        id: 'msg_flat_only',
+        model: 'claude-sonnet-4-5',
+        usage: { input_tokens: 10, output_tokens: 5, cache_creation_input_tokens: 120 },
+      },
+    });
+
+    const r = parseUsageLine(line, 'main', '', '', '') as OpenUsageRequest;
+
+    // Rows from older Claude Code versions/providers carry only the aggregate — it must not be lost.
+    expect(r.cacheCreation5mTokens).toBe(120);
+    expect(r.cacheCreation1hTokens).toBe(0);
+  });
+
+  it('derives the 5m tier as the aggregate minus the nested 1h tier when only 1h is split out', () => {
+    const line = JSON.stringify({
+      requestId: 'req_1h_only',
+      message: {
+        id: 'msg_1h_only',
+        model: 'claude-sonnet-4-5',
+        usage: {
+          input_tokens: 10,
+          output_tokens: 5,
+          cache_creation_input_tokens: 120,
+          cache_creation: { ephemeral_1h_input_tokens: 20 },
+        },
+      },
+    });
+
+    const r = parseUsageLine(line, 'main', '', '', '') as OpenUsageRequest;
+
+    expect(r.cacheCreation5mTokens).toBe(100);
+    expect(r.cacheCreation1hTokens).toBe(20);
+  });
+
+  it('never reports a negative 5m tier when the nested 1h tier exceeds the aggregate', () => {
+    const line = JSON.stringify({
+      requestId: 'req_inconsistent',
+      message: {
+        id: 'msg_inconsistent',
+        model: 'claude-sonnet-4-5',
+        usage: { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 5, cache_creation: { ephemeral_1h_input_tokens: 40 } },
+      },
+    });
+
+    const r = parseUsageLine(line, 'main', '', '', '') as OpenUsageRequest;
+
+    expect(r.cacheCreation5mTokens).toBe(0);
+    expect(r.cacheCreation1hTokens).toBe(40);
+  });
+
+  it('keeps the nested split authoritative when it disagrees with the flat aggregate', () => {
+    const line = JSON.stringify({
+      requestId: 'req_split_wins',
+      message: {
+        id: 'msg_split_wins',
+        model: 'claude-sonnet-4-5',
+        usage: {
+          input_tokens: 1,
+          output_tokens: 1,
+          cache_creation_input_tokens: 100,
+          cache_creation: { ephemeral_5m_input_tokens: 5, ephemeral_1h_input_tokens: 10 },
+        },
+      },
+    });
+
+    const r = parseUsageLine(line, 'main', '', '', '') as OpenUsageRequest;
+
+    expect(r.cacheCreation5mTokens).toBe(5);
+    expect(r.cacheCreation1hTokens).toBe(10);
   });
 
   it('reads the top-level requestId and message.id separately from a direct-session line', () => {
@@ -307,6 +382,7 @@ describe('buildUsageRequestEvent', () => {
       cache_creation_1h_tokens: 2,
       cache_read_tokens: 3,
       output_tokens: 4,
+      output_tokens_partial: false,
       thinking_tokens: 9,
       web_search_requests: 5,
       web_fetch_requests: 6,
@@ -322,6 +398,33 @@ describe('buildUsageRequestEvent', () => {
     // No event_id/schema_version here — those are stamped later, daemon-side.
     expect(event).not.toHaveProperty('event_id');
     expect(event).not.toHaveProperty('schema_version');
+  });
+
+  it('flags output_tokens_partial when the merged request never received a stop_reason', () => {
+    const req: OpenUsageRequest = {
+      requestId: 'req-1', messageId: 'msg-1', model: 'm', modelRaw: 'm-raw', timestamp: 't',
+      speed: 'standard', inferenceGeo: '', serviceTier: 'standard',
+      inputTokens: 0, cacheCreation5mTokens: 0, cacheCreation1hTokens: 0,
+      cacheReadTokens: 0, outputTokens: 3, thinkingTokens: null, webSearchRequests: 0, webFetchRequests: 0,
+      scopeKind: 'agent', scopeName: 'Explore', agentId: 'a1', agentType: 'Explore',
+      stopReason: '', isApiError: false, gitBranch: '',
+    };
+
+    expect(buildUsageRequestEvent('s', req).output_tokens_partial).toBe(true);
+    expect(buildUsageRequestEvent('s', { ...req, stopReason: 'end_turn' }).output_tokens_partial).toBe(false);
+  });
+
+  it('does not flag an API-error request without stop_reason as output_tokens_partial', () => {
+    const req: OpenUsageRequest = {
+      requestId: 'req-1', messageId: 'msg-1', model: 'm', modelRaw: 'm-raw', timestamp: 't',
+      speed: 'standard', inferenceGeo: '', serviceTier: 'standard',
+      inputTokens: 0, cacheCreation5mTokens: 0, cacheCreation1hTokens: 0,
+      cacheReadTokens: 0, outputTokens: 0, thinkingTokens: null, webSearchRequests: 0, webFetchRequests: 0,
+      scopeKind: 'agent', scopeName: 'Explore', agentId: 'a1', agentType: 'Explore',
+      stopReason: '', isApiError: true, gitBranch: '',
+    };
+
+    expect(buildUsageRequestEvent('s', req).output_tokens_partial).toBe(false);
   });
 
   it('passes a null thinkingTokens through as thinking_tokens: null, so the backend stores it as NULL rather than 0', () => {

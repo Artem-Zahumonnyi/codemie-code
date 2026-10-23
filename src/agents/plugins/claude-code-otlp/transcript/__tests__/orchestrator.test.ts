@@ -16,12 +16,30 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { logger } from '@/utils/logger.js';
+
+const { resolveSessionEnvFieldsMock, resolveVolatileSessionEnvFieldsMock } = vi.hoisted(() => ({
+  resolveSessionEnvFieldsMock: vi.fn(),
+  resolveVolatileSessionEnvFieldsMock: vi.fn(),
+}));
+
+// Mocked so `openSessionEnvCheckPass` tests control exactly what a "full" vs. "cheap" recompute
+// returns, instead of this file's real settings/plugin/MCP files leaking into the result.
+vi.mock('../../event-fields/session-env-fields.js', () => ({
+  resolveSessionEnvFields: resolveSessionEnvFieldsMock,
+  resolveVolatileSessionEnvFields: resolveVolatileSessionEnvFieldsMock,
+  sessionEnvFieldsEqual: (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b),
+}));
+
 import {
   openMainTranscriptPass,
+  openPostCompactPass,
+  openSessionStartPass,
+  openSessionEnvCheckPass,
   openSubagentPass,
   openSessionEndPass,
   type MainTranscriptTrigger,
@@ -57,6 +75,8 @@ function usageLine(opts: {
   messageId: string;
   requestId?: string;
   outputTokens: number;
+  model?: string;
+  isApiErrorMessage?: boolean;
   gitBranch?: string;
   stopReason?: string;
   timestamp?: string;
@@ -67,10 +87,11 @@ function usageLine(opts: {
     timestamp: opts.timestamp ?? '2026-10-01T00:00:00.000Z',
     uuid: opts.uuid,
     ...(opts.requestId ? { requestId: opts.requestId } : {}),
+    ...(opts.isApiErrorMessage ? { isApiErrorMessage: opts.isApiErrorMessage } : {}),
     message: {
       id: opts.messageId,
       role: 'assistant',
-      model: 'claude-sonnet-4-5-20250929',
+      model: opts.model ?? 'claude-sonnet-4-5-20250929',
       stop_reason: opts.stopReason ?? '',
       usage: {
         input_tokens: 100,
@@ -183,6 +204,29 @@ describe('openMainTranscriptPass — idempotent reparse', () => {
 });
 
 describe('openMainTranscriptPass — Stop trigger', () => {
+  it('flags API-error placeholders and excludes their synthetic model from the session summary', async () => {
+    const sessionId = 'session-synthetic-model';
+    const transcriptPath = writeTranscript('transcript-synthetic-model.jsonl', [
+      usageLine({ uuid: 'uuid-1', messageId: 'msg-1', outputTokens: 50 }),
+      usageLine({
+        uuid: 'uuid-2',
+        messageId: 'msg-2',
+        outputTokens: 0,
+        model: '<synthetic>',
+        isApiErrorMessage: true,
+      }),
+    ]);
+
+    const events = parseAll(await mainEvents(sessionId, transcriptPath, 'Stop'));
+    const usageEvents = events.filter((event) => event.type === 'agent.usage.request');
+    const summary = events.find((event) => event.type === 'agent.session.summary');
+
+    expect(usageEvents).toHaveLength(2);
+    expect(usageEvents.find((event) => event.message_id === 'msg-2')?.is_api_error).toBe(true);
+    expect(summary?.models).toEqual(['claude-sonnet-4-5-20250929']);
+    expect(summary?.primary_model).toBe('claude-sonnet-4-5-20250929');
+  });
+
   it('returns one agent.usage.request event per distinct request plus one incremental agent.session.summary', async () => {
 
     const sessionId = 'session-stop-basic';
@@ -310,6 +354,273 @@ describe('openMainTranscriptPass — compactions', () => {
 
     expect(summary.compaction_count).toBe(1);
     expect(summary.compaction_pre_tokens).toBe(1000);
+  });
+
+  it('surfaces a new boundary line as an agent.session.compact.done record, via openPostCompactPass only', async () => {
+    const sessionId = 'session-compaction-done';
+    const transcriptPath = writeTranscript('transcript-compaction-done.jsonl', [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'compact_boundary',
+        timestamp: '2026-10-01T00:10:00.000Z',
+        compactMetadata: { trigger: 'auto', preTokens: 1000, postTokens: 300, durationMs: 60_000 },
+      }),
+    ]);
+
+    const pass = await openPostCompactPass(sessionId, transcriptPath, 2_000);
+    await pass.finalize(true);
+
+    expect(pass.events).toEqual([
+      {
+        type: 'agent.session.compact.done',
+        session_id: sessionId,
+        pre_tokens: 1000,
+        post_tokens: 300,
+        dropped_tokens: 700,
+        duration_ms: 60_000,
+        timestamp: '2026-10-01T00:10:00.000Z',
+      },
+    ]);
+  });
+
+  it('never surfaces agent.session.compact.done on Stop/PreCompact/StopFailure/SessionEnd — only openPostCompactPass derives it', async () => {
+    const boundaryLine = JSON.stringify({
+      type: 'system',
+      subtype: 'compact_boundary',
+      timestamp: '2026-10-01T00:10:00.000Z',
+      compactMetadata: { trigger: 'auto', preTokens: 1000, postTokens: 300, durationMs: 60_000 },
+    });
+
+    for (const trigger of ['Stop', 'PreCompact', 'StopFailure', 'SessionEnd'] as const) {
+      const sessionId = `session-compaction-not-done-${trigger}`;
+      const transcriptPath = writeTranscript(`transcript-compaction-not-done-${trigger}.jsonl`, [boundaryLine]);
+
+      const pass = await openMainTranscriptPass(sessionId, transcriptPath, trigger);
+      await pass.finalize(true);
+
+      expect(pass.events.some((e) => e.type === 'agent.session.compact.done')).toBe(false);
+    }
+  });
+
+  it('does not re-surface agent.session.compact.done for a boundary line already reported by an earlier PostCompact pass', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn');
+    const debugSpy = vi.spyOn(logger, 'debug');
+    try {
+      const sessionId = 'session-compaction-done-once';
+      const transcriptPath = writeTranscript('transcript-compaction-done-once.jsonl', [
+        JSON.stringify({
+          type: 'system',
+          subtype: 'compact_boundary',
+          timestamp: '2026-10-01T00:10:00.000Z',
+          compactMetadata: { trigger: 'auto', preTokens: 1000, postTokens: 300, durationMs: 60_000 },
+        }),
+      ]);
+
+      const first = await openPostCompactPass(sessionId, transcriptPath, 2_000);
+      await first.finalize(true);
+      expect(first.events.some((e) => e.type === 'agent.session.compact.done')).toBe(true);
+
+      const second = await openPostCompactPass(sessionId, transcriptPath, 2_000);
+      await second.finalize(true);
+      expect(second.events.some((e) => e.type === 'agent.session.compact.done')).toBe(false);
+      // "Already accounted for" is not the same as "not found": only the latter is a warning.
+      expect(
+        warnSpy.mock.calls.some(([message]) => String(message).includes('compact_boundary not found'))
+      ).toBe(false);
+      expect(
+        debugSpy.mock.calls.some(([message]) => String(message).includes('compact_boundary already accounted for'))
+      ).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+      debugSpy.mockRestore();
+    }
+  });
+
+  it('reports a second, later compaction without re-reporting the first', async () => {
+    const sessionId = 'session-compaction-twice';
+    const transcriptPath = writeTranscript('transcript-compaction-twice.jsonl', [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'compact_boundary',
+        timestamp: '2026-10-01T00:10:00.000Z',
+        compactMetadata: { trigger: 'auto', preTokens: 1000, postTokens: 300, durationMs: 60_000 },
+      }),
+    ]);
+
+    const first = await openPostCompactPass(sessionId, transcriptPath, 2_000);
+    await first.finalize(true);
+    expect(first.events.filter((e) => e.type === 'agent.session.compact.done')).toHaveLength(1);
+
+    appendFileSync(
+      transcriptPath,
+      JSON.stringify({
+        type: 'system',
+        subtype: 'compact_boundary',
+        timestamp: '2026-10-01T00:20:00.000Z',
+        compactMetadata: { trigger: 'auto', preTokens: 2000, postTokens: 500, durationMs: 30_000 },
+      }) + '\n'
+    );
+
+    const second = await openPostCompactPass(sessionId, transcriptPath, 2_000);
+    await second.finalize(true);
+    const secondDone = second.events.filter((e) => e.type === 'agent.session.compact.done');
+    expect(secondDone).toHaveLength(1);
+    expect(secondDone[0].timestamp).toBe('2026-10-01T00:20:00.000Z');
+  });
+
+  it('collects each boundary once when another boundary lands during PostCompact with no saved marker', async () => {
+    const sessionId = 'session-compaction-delayed-boundary';
+    const transcriptPath = writeTranscript('transcript-compaction-delayed-boundary.jsonl', [
+      JSON.stringify({
+        type: 'system',
+        subtype: 'compact_boundary',
+        timestamp: '2026-10-01T00:10:00.000Z',
+        compactMetadata: { trigger: 'auto', preTokens: 1000, postTokens: 300, durationMs: 60_000 },
+      }),
+    ]);
+
+    const passPromise = openPostCompactPass(sessionId, transcriptPath, 250);
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    appendFileSync(
+      transcriptPath,
+      JSON.stringify({
+        type: 'system',
+        subtype: 'compact_boundary',
+        timestamp: '2026-10-01T00:20:00.000Z',
+        compactMetadata: { trigger: 'auto', preTokens: 2000, postTokens: 500, durationMs: 30_000 },
+      }) + '\n'
+    );
+
+    const pass = await passPromise;
+    await pass.finalize(true);
+
+    const compactDone = pass.events.filter((event) => event.type === 'agent.session.compact.done');
+    expect(compactDone).toHaveLength(2);
+    expect(compactDone.map((event) => event.timestamp)).toEqual([
+      '2026-10-01T00:10:00.000Z',
+      '2026-10-01T00:20:00.000Z',
+    ]);
+  });
+
+  it('waits (lock-free) past a compact_boundary line that lands just after PostCompact fires, rather than missing it', async () => {
+    const sessionId = 'session-compaction-race';
+    const transcriptPath = writeTranscript('transcript-compaction-race.jsonl', []);
+
+    const passPromise = openPostCompactPass(sessionId, transcriptPath, 2_000);
+
+    // The boundary line lands on disk shortly after the hook fires — after the pass's first,
+    // immediate read already came up empty, but well inside the polling wait budget.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    appendFileSync(
+      transcriptPath,
+      JSON.stringify({
+        type: 'system',
+        subtype: 'compact_boundary',
+        timestamp: '2026-10-01T00:10:00.000Z',
+        compactMetadata: { trigger: 'auto', preTokens: 1000, postTokens: 300, durationMs: 60_000 },
+      }) + '\n'
+    );
+
+    const pass = await passPromise;
+    await pass.finalize(true);
+
+    expect(pass.events).toEqual([
+      {
+        type: 'agent.session.compact.done',
+        session_id: sessionId,
+        pre_tokens: 1000,
+        post_tokens: 300,
+        dropped_tokens: 700,
+        duration_ms: 60_000,
+        timestamp: '2026-10-01T00:10:00.000Z',
+      },
+    ]);
+  });
+
+  it('gives up quietly — no synthetic/duplicate event — once the wait budget is exhausted with no boundary line ever appearing', async () => {
+    const sessionId = 'session-compaction-never';
+    const transcriptPath = writeTranscript('transcript-compaction-never.jsonl', [
+      usageLine({ uuid: 'uuid-1', messageId: 'msg-1', outputTokens: 50 }),
+    ]);
+    const warnSpy = vi.spyOn(logger, 'warn');
+
+    try {
+      // A tiny real budget — the boundary line never shows up in this test either way, so this just
+      // keeps the test fast instead of waiting out the full production budget.
+      const pass = await openPostCompactPass(sessionId, transcriptPath, 50);
+      await pass.finalize(true);
+
+      // The one usage line is still reported; no agent.session.compact.done shows up anywhere.
+      expect(pass.events).toHaveLength(1);
+      expect(pass.events.some((e) => e.type === 'agent.session.compact.done')).toBe(false);
+      // A genuinely missing boundary is still the one case that warns.
+      expect(
+        warnSpy.mock.calls.some(([message]) => String(message).includes('compact_boundary not found'))
+      ).toBe(true);
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('returns immediately instead of waiting out the budget when the transcript does not exist', async () => {
+    const sessionId = 'session-compaction-missing-transcript';
+    const transcriptPath = join(transcriptDir, 'no-such-transcript.jsonl');
+    const started = Date.now();
+
+    const pass = await openPostCompactPass(sessionId, transcriptPath, 5_000);
+    await pass.finalize(true);
+
+    // The budget is 5s — a missing file must short-circuit it rather than poll for the full time.
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect(pass.events.some((e) => e.type === 'agent.session.compact.done')).toBe(false);
+  });
+
+  it('collects a boundary line whose trailing newline lands only after the first incremental read', async () => {
+    const sessionId = 'session-compaction-partial-line';
+    const transcriptPath = join(transcriptDir, 'transcript-compaction-partial-line.jsonl');
+    const boundary = JSON.stringify({
+      type: 'system',
+      subtype: 'compact_boundary',
+      timestamp: '2026-10-01T00:10:00.000Z',
+      compactMetadata: { trigger: 'auto', preTokens: 1000, postTokens: 300, durationMs: 60_000 },
+    });
+    // Written without its trailing newline: the first polls see an incomplete line, which the
+    // incremental reader must not lose once the newline arrives.
+    writeFileSync(transcriptPath, boundary, 'utf-8');
+
+    const passPromise = openPostCompactPass(sessionId, transcriptPath, 1_500);
+    // Past the first poll (t=0) and the one at ~500ms, so both read an incomplete line.
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    appendFileSync(transcriptPath, '\n');
+
+    const pass = await passPromise;
+    await pass.finalize(true);
+
+    expect(pass.events.filter((event) => event.type === 'agent.session.compact.done')).toHaveLength(1);
+  });
+
+  it('does not hold the per-session lock during the lock-free wait, so a sibling pass is never blocked by it', async () => {
+    const sessionId = 'session-compaction-no-lock-contention';
+    const transcriptPath = writeTranscript('transcript-compaction-no-lock-contention.jsonl', []);
+
+    // No boundary line ever appears, so openPostCompactPass spends its whole wait budget
+    // lock-free. A sibling openMainTranscriptPass for the same session must still complete
+    // promptly instead of queueing behind it.
+    const postCompactPromise = openPostCompactPass(sessionId, transcriptPath, 300);
+
+    const siblingTranscriptPath = writeTranscript('transcript-compaction-no-lock-contention-sibling.jsonl', [
+      usageLine({ uuid: 'uuid-1', messageId: 'msg-1', outputTokens: 50 }),
+    ]);
+    const started = Date.now();
+    const sibling = await openMainTranscriptPass(sessionId, siblingTranscriptPath, 'Stop');
+    await sibling.finalize(true);
+    const siblingDurationMs = Date.now() - started;
+
+    expect(siblingDurationMs).toBeLessThan(300);
+    expect(sibling.events.some((e) => e.type === 'agent.usage.request')).toBe(true);
+
+    const postCompactPass = await postCompactPromise;
+    await postCompactPass.finalize(true);
   });
 });
 
@@ -478,6 +789,30 @@ describe('openMainTranscriptPass — api_calls', () => {
 
     const summary = pass.events.find((e) => e.type === 'agent.session.summary');
     // 2 main-thread requests (1 main + 1 skill); the subagent's request must not inflate this.
+    expect(summary?.api_calls).toBe(2);
+  });
+
+  it('excludes a forked skill subagent\'s already-persisted requests from a later Stop summary (EPMCDME-15968 regression)', async () => {
+    const sessionId = 'session-api-calls-forked-skill';
+    const file = writeSubagentFixture(sessionId, 'a1', [
+      usageLine({ uuid: 'uuid-a1-1', messageId: 'msg-a1-1', outputTokens: 30 }),
+      usageLine({ uuid: 'uuid-a1-2', messageId: 'msg-a1-2', outputTokens: 40 }),
+      usageLine({ uuid: 'uuid-a1-3', messageId: 'msg-a1-3', outputTokens: 50 }),
+    ]);
+    // A forked skill's subagent — its usage is persisted as scope_kind='skill' (same as a
+    // main-thread inline skill) via its own SubagentStop, *before* the main Stop below runs.
+    const subagentPass = await subagentEvents(sessionId, { ...file, skillName: 'code-review' });
+    expect(subagentPass.filter((e) => e.type === 'agent.usage.request')).toHaveLength(3);
+
+    const mainTranscriptPath = writeTranscript(`${sessionId}.jsonl`, [
+      usageLine({ uuid: 'u1', messageId: 'msg-1', outputTokens: 10 }),
+      usageLine({ uuid: 'u2', messageId: 'msg-2', outputTokens: 20 }),
+    ]);
+    const events = await mainEvents(sessionId, mainTranscriptPath, 'Stop');
+    const summary = events.find((e) => e.type === 'agent.session.summary');
+
+    // 2 main-thread requests only; the forked skill's 3 already-persisted subagent requests
+    // (scope_kind='skill', but with their own agentId) must not inflate this.
     expect(summary?.api_calls).toBe(2);
   });
 });
@@ -792,6 +1127,37 @@ describe('openSubagentPass — request identity', () => {
     expect(usage[0]).toMatchObject({ agent_type: '', scope_kind: 'agent', scope_name: '' });
   });
 
+  it('scopes a forked skill (SubagentFile.skillName set) as scope_kind=skill/scope_name=<skillName>, never scope_kind=agent (EPMCDME-15968)', async () => {
+
+    const sessionId = 'session-sub-forked-skill';
+    const file = writeSubagentFixture(sessionId, 'a1', [
+      usageLine({ uuid: 'u1', messageId: 'msg_a', outputTokens: 10 }),
+    ]);
+
+    const events = await subagentEvents(sessionId, { ...file, agentType: 'general-purpose', skillName: 'code-review' });
+    const usage = events.filter((e) => e.type === 'agent.usage.request');
+    const subagentUsage = events.find((e) => e.type === 'agent.subagent.usage');
+
+    // agent_type is kept as-is (still informative) — only scope_kind/scope_name change.
+    expect(usage[0]).toMatchObject({ agent_type: 'general-purpose', scope_kind: 'skill', scope_name: 'code-review' });
+    expect(subagentUsage?.usage).toEqual([
+      expect.objectContaining({ scope_kind: 'skill', scope_name: 'code-review' }),
+    ]);
+  });
+
+  it('falls back to agentType for scope_name when SubagentFile.skillName is an empty string, keeping scope_kind=agent consistent with scope_name (EPMCDME-15968 regression)', async () => {
+
+    const sessionId = 'session-sub-empty-skill-name';
+    const file = writeSubagentFixture(sessionId, 'a1', [
+      usageLine({ uuid: 'u1', messageId: 'msg_a', outputTokens: 10 }),
+    ]);
+
+    const events = await subagentEvents(sessionId, { ...file, agentType: 'general-purpose', skillName: '' });
+    const usage = events.filter((e) => e.type === 'agent.usage.request');
+
+    expect(usage[0]).toMatchObject({ scope_kind: 'agent', scope_name: 'general-purpose' });
+  });
+
   it('carries agentType onto agent.subagent.usage\'s usage[] rows as scope_name, matching the contract\'s (model, speed, inference_geo, service_tier, scope_kind, scope_name) grouping key (EPMCDME-15783)', async () => {
 
     const sessionId = 'session-sub-usage-scope-name';
@@ -1020,5 +1386,778 @@ describe('commit-after-send: finalize(accepted)', () => {
     saveSpy.mockRestore();
     const release = await parseState.acquireParseStateLock(sessionId); // would hang if still held
     await release();
+  });
+});
+
+describe('openSubagentPass — partial output_tokens (stop_reason null rows)', () => {
+  it('flags requests that never received a stop_reason as partial and leaves finalized ones unflagged', async () => {
+    const fixture = readFileSync(
+      join(dirname(fileURLToPath(import.meta.url)), 'fixtures', 'transcript-subagent-direct.jsonl'),
+      'utf-8'
+    ).trimEnd().split('\n');
+    const sessionId = 'session-sub-partial';
+    const file = writeSubagentFixture(sessionId, 'bg1', fixture);
+
+    const events = await subagentEvents(sessionId, file);
+    const usage = events.filter((e) => e.type === 'agent.usage.request');
+    const byReq = Object.fromEntries(usage.map((e) => [e.request_id, e]));
+
+    expect(byReq.req_s1).toMatchObject({ output_tokens: 3, output_tokens_partial: true });
+    expect(byReq.req_s2).toMatchObject({ output_tokens: 8, output_tokens_partial: true });
+    // streamed row (1) later finalized (300): max-merge keeps the final count, not partial.
+    expect(byReq.req_s3).toMatchObject({ output_tokens: 300, output_tokens_partial: false });
+    expect(byReq.req_s4).toMatchObject({ output_tokens: 457, output_tokens_partial: false });
+    // a later row without stop_reason must not un-finalize a request that already has one.
+    expect(byReq.req_s5).toMatchObject({ output_tokens: 50, output_tokens_partial: false });
+    // API-error rows carry no stop_reason by nature and are not partial.
+    expect(byReq.req_s6).toMatchObject({ is_api_error: true, output_tokens_partial: false });
+
+    const summary = events.find((e) => e.type === 'agent.subagent.usage') as { usage: Array<Record<string, unknown>> };
+    expect(summary.usage[0]).toMatchObject({ output_tokens: 818, output_tokens_partial: true });
+  });
+});
+
+const sessionEnvFixture = {
+  provider: 'anthropic',
+  api_host: 'api.anthropic.com',
+  configured_model: 'claude-sonnet-5',
+  effort: '',
+  permission_mode: 'auto',
+  output_style: '',
+  plugins: {},
+  mcp_servers: [] as string[],
+  os: 'linux',
+  arch: 'x64',
+  node_version: 'v20.0.0',
+  timezone: 'UTC',
+  hostname_hash: 'deadbeef',
+};
+
+describe('openSessionStartPass', () => {
+  it('derives no events of its own', async () => {
+    const pass = await openSessionStartPass('session-start-no-events', 'sha-start', sessionEnvFixture);
+    expect(pass.events).toEqual([]);
+    expect(pass.gitHeadStart).toBe('sha-start');
+    await pass.finalize(true);
+  });
+
+  it('finalize(true) persists git_head_start/sessionStartedAt so a later SessionEnd reads them back', async () => {
+    const sessionId = 'session-start-accepted';
+    const transcriptPath = writeTranscript('transcript-session-start-accepted.jsonl', [noUsageLine('uuid-main')]);
+
+    const startPass = await openSessionStartPass(sessionId, 'sha-abc123', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    const endPass = await openSessionEndPass(sessionId, transcriptPath, '/repo');
+    expect(endPass.gitHeadStart).toBe('sha-abc123');
+    expect(endPass.sessionStartedAt).not.toBe('');
+    await endPass.finalize(true);
+  });
+
+  it('finalize(false) persists nothing, so a later SessionEnd falls back to empty start fields', async () => {
+    const sessionId = 'session-start-rejected';
+    const transcriptPath = writeTranscript('transcript-session-start-rejected.jsonl', [noUsageLine('uuid-main')]);
+
+    const startPass = await openSessionStartPass(sessionId, 'sha-abc123', sessionEnvFixture);
+    await startPass.finalize(false); // the send failed — nothing committed
+
+    const endPass = await openSessionEndPass(sessionId, transcriptPath, '/repo');
+    expect(endPass.gitHeadStart).toBe('');
+    expect(endPass.sessionStartedAt).toBe('');
+    await endPass.finalize(true);
+  });
+
+  it('a later SessionStart fire (e.g. source: compact/resume) does not overwrite the real session start', async () => {
+    const sessionId = 'session-start-second-fire';
+    const transcriptPath = writeTranscript('transcript-session-start-second-fire.jsonl', [noUsageLine('uuid-main')]);
+
+    vi.useFakeTimers();
+    try {
+      vi.setSystemTime(new Date('2026-01-01T00:00:00.000Z'));
+      const firstPass = await openSessionStartPass(sessionId, 'sha-real-start', sessionEnvFixture);
+      await firstPass.finalize(true);
+
+      // A later SessionStart fire for the SAME session (compact/resume) resolves a different
+      // HEAD and a later wall-clock time — neither should replace what was recorded first.
+      vi.setSystemTime(new Date('2026-01-01T01:00:00.000Z'));
+      const secondPass = await openSessionStartPass(sessionId, 'sha-after-compact', sessionEnvFixture);
+      expect(secondPass.gitHeadStart).toBe('sha-real-start');
+      await secondPass.finalize(true);
+    } finally {
+      vi.useRealTimers();
+    }
+
+    const endPass = await openSessionEndPass(sessionId, transcriptPath, '/repo');
+    expect(endPass.gitHeadStart).toBe('sha-real-start');
+    expect(endPass.sessionStartedAt).toBe('2026-01-01T00:00:00.000Z');
+    await endPass.finalize(true);
+  });
+
+  it('also records the sessionEnvFields baseline for a later openSessionEnvCheckPass to diff against', async () => {
+    const sessionId = 'session-start-env-baseline';
+    const startPass = await openSessionStartPass(sessionId, 'sha-abc123', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    // Nothing changed relative to the baseline just recorded -> cheap check finds no diff.
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: sessionEnvFixture.effort,
+      permission_mode: sessionEnvFixture.permission_mode,
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: sessionEnvFixture.timezone,
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+    const check = await openSessionEnvCheckPass(sessionId, {
+      effort: sessionEnvFixture.effort,
+      permissionMode: sessionEnvFixture.permission_mode,
+    });
+    expect(check.sessionEnvFields).toBeNull();
+    await check.finalize(true);
+  });
+
+  it('a later SessionStart fire merges onto the prior lastSessionEnvFields snapshot instead of overwriting it', async () => {
+    const sessionId = 'session-start-env-merge';
+    const firstFields = { ...sessionEnvFixture, effort: 'high', permission_mode: 'acceptEdits', configured_model: 'claude-opus-5' };
+    const firstPass = await openSessionStartPass(sessionId, 'sha-1', firstFields);
+    expect(firstPass.sessionEnvFields).toEqual(firstFields); // first fire: unchanged
+    await firstPass.finalize(true);
+
+    // Resume fire: fresh payload has empty effort/permission_mode/configured_model.
+    const resumeFields = { ...sessionEnvFixture, effort: '', permission_mode: '', configured_model: '' };
+    const secondPass = await openSessionStartPass(sessionId, 'sha-2', resumeFields);
+    expect(secondPass.sessionEnvFields).toMatchObject({
+      effort: 'high',
+      permission_mode: 'acceptEdits',
+      configured_model: 'claude-opus-5',
+    });
+    await secondPass.finalize(true);
+  });
+
+  it('a later SessionStart fire prefers its own non-empty permission_mode/configured_model over the prior snapshot', async () => {
+    const sessionId = 'session-start-env-merge-prefers-own';
+    const firstFields = { ...sessionEnvFixture, effort: 'high', permission_mode: 'acceptEdits', configured_model: 'claude-opus-5' };
+    const firstPass = await openSessionStartPass(sessionId, 'sha-1', firstFields);
+    await firstPass.finalize(true);
+
+    const switchedFields = { ...sessionEnvFixture, effort: '', permission_mode: 'plan', configured_model: 'claude-sonnet-5' };
+    const secondPass = await openSessionStartPass(sessionId, 'sha-2', switchedFields);
+    expect(secondPass.sessionEnvFields).toMatchObject({
+      effort: 'high', // still carried forward: SessionStart payload never has it
+      permission_mode: 'plan', // fresh payload's own non-empty value wins
+      configured_model: 'claude-sonnet-5',
+    });
+    await secondPass.finalize(true);
+  });
+
+  it('a Stop immediately after a compact/resume SessionStart finds no diff against the merged snapshot (no duplicate agent.session.env)', async () => {
+    // End-to-end proof of ticket Expected-Result bullet 3: SessionStart's merge must leave the
+    // baseline already correct, so the very next Stop's cheap check (openSessionEnvCheckPass,
+    // no `full`) reports no change and therefore no second agent.session.env is ever built.
+    const sessionId = 'session-start-env-merge-then-stop';
+    const firstFields = { ...sessionEnvFixture, effort: 'high', permission_mode: 'acceptEdits', configured_model: 'claude-opus-5' };
+    const firstPass = await openSessionStartPass(sessionId, 'sha-1', firstFields);
+    await firstPass.finalize(true);
+
+    // Compact/resume fire: fresh payload has empty effort/permission_mode/configured_model —
+    // openSessionStartPass must merge these back onto `last` (same scenario as the first test above).
+    const resumeFields = { ...sessionEnvFixture, effort: '', permission_mode: '', configured_model: '' };
+    const secondPass = await openSessionStartPass(sessionId, 'sha-2', resumeFields);
+    expect(secondPass.sessionEnvFields).toMatchObject({
+      effort: 'high',
+      permission_mode: 'acceptEdits',
+      configured_model: 'claude-opus-5',
+    });
+    await secondPass.finalize(true);
+
+    // Stop fires next, reporting the SAME real effort/permission_mode SessionStart's merge
+    // already correctly captured — exactly what a genuine "nothing changed" Stop looks like.
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: 'high',
+      permission_mode: 'acceptEdits',
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: sessionEnvFixture.timezone,
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+    const stopCheck = await openSessionEnvCheckPass(sessionId, { effort: 'high', permissionMode: 'acceptEdits' });
+    expect(stopCheck.sessionEnvFields).toBeNull(); // sessionEnvFieldsEqual found no diff: no second agent.session.env
+    await stopCheck.finalize(true);
+  });
+});
+
+describe('openSessionEnvCheckPass', () => {
+  beforeEach(() => {
+    resolveSessionEnvFieldsMock.mockReset();
+    resolveVolatileSessionEnvFieldsMock.mockReset();
+  });
+
+  it('returns null without recomputing anything when there is no baseline and no full input', async () => {
+    const check = await openSessionEnvCheckPass('session-env-no-baseline', {
+      effort: '',
+      permissionMode: 'auto',
+    });
+
+    expect(check.sessionEnvFields).toBeNull();
+    expect(resolveVolatileSessionEnvFieldsMock).not.toHaveBeenCalled();
+    expect(resolveSessionEnvFieldsMock).not.toHaveBeenCalled();
+    await check.finalize(true);
+  });
+
+  it('cheap path: merges a changed effort onto the baseline and persists only on finalize(true)', async () => {
+    const sessionId = 'session-env-cheap-change';
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: 'high',
+      permission_mode: sessionEnvFixture.permission_mode,
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: sessionEnvFixture.timezone,
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+
+    const check = await openSessionEnvCheckPass(sessionId, { effort: 'high', permissionMode: sessionEnvFixture.permission_mode });
+    expect(check.sessionEnvFields).toMatchObject({ effort: 'high', configured_model: sessionEnvFixture.configured_model });
+    await check.finalize(true);
+
+    // A later check against the SAME now-persisted value finds no further diff.
+    const second = await openSessionEnvCheckPass(sessionId, { effort: 'high', permissionMode: sessionEnvFixture.permission_mode });
+    expect(second.sessionEnvFields).toBeNull();
+    await second.finalize(true);
+  });
+
+  it('cheap path: finalize(false) leaves the baseline untouched, so the next check still sees the old diff', async () => {
+    const sessionId = 'session-env-cheap-rejected';
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: 'high',
+      permission_mode: sessionEnvFixture.permission_mode,
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: sessionEnvFixture.timezone,
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+
+    const first = await openSessionEnvCheckPass(sessionId, { effort: 'high', permissionMode: sessionEnvFixture.permission_mode });
+    expect(first.sessionEnvFields).not.toBeNull();
+    await first.finalize(false); // send failed — nothing committed
+
+    const second = await openSessionEnvCheckPass(sessionId, { effort: 'high', permissionMode: sessionEnvFixture.permission_mode });
+    expect(second.sessionEnvFields).not.toBeNull(); // still a diff against the un-updated baseline
+    await second.finalize(true);
+  });
+
+  it('cheap path: an empty effort/permissionMode input (PreCompact/SessionEnd payload shape) keeps the baseline, not blanks it', async () => {
+    const sessionId = 'session-env-cheap-empty-payload';
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    // Mirrors resolveVolatileSessionEnvFields's real pass-through behavior for a payload
+    // that carries neither field (PreCompact/SessionEnd never populate them).
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: '',
+      permission_mode: '',
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: sessionEnvFixture.timezone,
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+
+    const check = await openSessionEnvCheckPass(sessionId, { effort: '', permissionMode: '' });
+
+    expect(check.sessionEnvFields).toBeNull();
+    await check.finalize(true);
+  });
+
+  it('cheap path: an empty effort/permissionMode input still lets a genuinely changed volatile field through', async () => {
+    const sessionId = 'session-env-cheap-empty-payload-other-change';
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: '',
+      permission_mode: '',
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: 'Antarctica/Troll', // genuinely changed, unrelated to effort/permission_mode
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+
+    const check = await openSessionEnvCheckPass(sessionId, { effort: '', permissionMode: '' });
+
+    expect(check.sessionEnvFields).toMatchObject({
+      effort: sessionEnvFixture.effort,
+      permission_mode: sessionEnvFixture.permission_mode,
+      timezone: 'Antarctica/Troll',
+    });
+    await check.finalize(true);
+  });
+
+  it('full path: builds a fresh baseline even with no prior snapshot, and always emits it', async () => {
+    resolveSessionEnvFieldsMock.mockResolvedValue({ ...sessionEnvFixture, configured_model: 'claude-opus-5' });
+
+    const check = await openSessionEnvCheckPass('session-env-full-no-baseline', {
+      effort: '',
+      permissionMode: 'auto',
+      full: { cwd: '/repo', configuredModel: 'claude-opus-5' },
+    });
+
+    expect(check.sessionEnvFields).toMatchObject({ configured_model: 'claude-opus-5' });
+    expect(resolveSessionEnvFieldsMock).toHaveBeenCalledWith('/repo', 'claude-opus-5', 'auto');
+    await check.finalize(true);
+  });
+
+  it('builds a full env baseline on the first lifecycle check when SessionStart was missed', async () => {
+    const sessionId = 'session-env-late-baseline';
+    resolveSessionEnvFieldsMock.mockResolvedValue({
+      ...sessionEnvFixture,
+      configured_model: '',
+      permission_mode: 'acceptEdits',
+    });
+
+    const first = await openSessionEnvCheckPass(sessionId, {
+      effort: '',
+      permissionMode: 'acceptEdits',
+      cwd: '/repo',
+    });
+
+    expect(first.sessionEnvFields).toMatchObject({
+      provider: 'anthropic',
+      permission_mode: 'acceptEdits',
+      configured_model: '',
+    });
+    expect(resolveSessionEnvFieldsMock).toHaveBeenCalledWith('/repo', '', 'acceptEdits');
+    await first.finalize(true);
+
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: '',
+      permission_mode: 'acceptEdits',
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: sessionEnvFixture.timezone,
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+    const next = await openSessionEnvCheckPass(sessionId, {
+      effort: '',
+      permissionMode: 'acceptEdits',
+      cwd: '/repo',
+    });
+
+    expect(next.sessionEnvFields).toBeNull();
+    await next.finalize(true);
+  });
+
+  it('full path: falls back to the last snapshot\'s configured_model when the trigger supplies none (ConfigChange)', async () => {
+    const sessionId = 'session-env-full-fallback-model';
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    resolveSessionEnvFieldsMock.mockResolvedValue({ ...sessionEnvFixture, output_style: 'concise' });
+
+    const check = await openSessionEnvCheckPass(sessionId, {
+      effort: '',
+      permissionMode: sessionEnvFixture.permission_mode,
+      full: { cwd: '/repo' }, // no configuredModel - ConfigChange doesn't carry one
+    });
+
+    expect(resolveSessionEnvFieldsMock).toHaveBeenCalledWith('/repo', sessionEnvFixture.configured_model, sessionEnvFixture.permission_mode);
+    expect(check.sessionEnvFields).toMatchObject({ output_style: 'concise' });
+    await check.finalize(true);
+  });
+
+  it('full path: an empty effort/permissionMode input (PostModelSwitch/ConfigChange payload shape) keeps the baseline, not blanks it', async () => {
+    const sessionId = 'session-env-full-empty-payload';
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    // ConfigChange/PostModelSwitch can fire with no effort/permission_mode in the hook payload;
+    // the full recompute itself still surfaces some other genuinely changed field (output_style).
+    resolveSessionEnvFieldsMock.mockResolvedValue({
+      ...sessionEnvFixture,
+      effort: '',
+      permission_mode: '',
+      output_style: 'concise',
+    });
+
+    const check = await openSessionEnvCheckPass(sessionId, {
+      effort: '',
+      permissionMode: '',
+      full: { cwd: '/repo', configuredModel: sessionEnvFixture.configured_model },
+    });
+
+    expect(check.sessionEnvFields).toMatchObject({
+      effort: sessionEnvFixture.effort,
+      permission_mode: sessionEnvFixture.permission_mode,
+      output_style: 'concise',
+    });
+    await check.finalize(true);
+  });
+
+  it('PostModelSwitch clears the previous effort when the new model has no effort level', async () => {
+    const sessionId = 'session-env-model-switch-clears-effort';
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', {
+      ...sessionEnvFixture,
+      effort: 'high',
+    });
+    await startPass.finalize(true);
+
+    resolveSessionEnvFieldsMock.mockResolvedValue({
+      ...sessionEnvFixture,
+      configured_model: 'claude-sonnet-5',
+    });
+
+    const check = await openSessionEnvCheckPass(sessionId, {
+      effort: '',
+      permissionMode: sessionEnvFixture.permission_mode,
+      full: {
+        cwd: '/repo',
+        configuredModel: 'claude-sonnet-5',
+        replaceEffort: true,
+      },
+    });
+
+    expect(check.sessionEnvFields).toMatchObject({
+      configured_model: 'claude-sonnet-5',
+      effort: '',
+    });
+    await check.finalize(true);
+  });
+
+  it('full path: returns null when the full recompute matches the existing baseline exactly', async () => {
+    const sessionId = 'session-env-full-unchanged';
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    resolveSessionEnvFieldsMock.mockResolvedValue({ ...sessionEnvFixture, effort: '', permission_mode: sessionEnvFixture.permission_mode });
+
+    const check = await openSessionEnvCheckPass(sessionId, {
+      effort: '',
+      permissionMode: sessionEnvFixture.permission_mode,
+      full: { cwd: '/repo', configuredModel: sessionEnvFixture.configured_model },
+    });
+
+    expect(check.sessionEnvFields).toBeNull();
+    await check.finalize(true);
+  });
+});
+
+/**
+ * Regression coverage: these hooks used to run their own pass and a separate
+ * `openSessionEnvCheckPass` concurrently, both acquiring the same per-session lock from the same
+ * process — the second acquisition always stalled for the full `LOCK_WAIT_BUDGET_MS`. The fix
+ * folds the env-check into the sibling pass's own already-held lock via `envCheck`.
+ */
+describe('envCheck fold-in — single lock acquisition (regression for the Stop/env-check deadlock)', () => {
+  beforeEach(() => {
+    resolveSessionEnvFieldsMock.mockReset();
+    resolveVolatileSessionEnvFieldsMock.mockReset();
+  });
+
+  it('openMainTranscriptPass appends a changed agent.session.env record derived from envCheck, resolving almost instantly (no second lock wait)', async () => {
+    const sessionId = 'session-envcheck-stop-changed';
+    const transcriptPath = writeTranscript('transcript-envcheck-stop-changed.jsonl', [noUsageLine('uuid-main')]);
+
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: 'high',
+      permission_mode: sessionEnvFixture.permission_mode,
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: sessionEnvFixture.timezone,
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+
+    const started = Date.now();
+    const pass = await openMainTranscriptPass(sessionId, transcriptPath, 'Stop', {
+      effort: 'high',
+      permissionMode: sessionEnvFixture.permission_mode,
+    });
+    const elapsedMs = Date.now() - started;
+
+    // The old double-lock-acquisition bug stalled for the full 10s LOCK_WAIT_BUDGET_MS on every
+    // Stop; a single acquisition resolves immediately regardless of machine speed.
+    expect(elapsedMs).toBeLessThan(2_000);
+
+    const envEvent = pass.events.find((e) => e.type === 'agent.session.env');
+    expect(envEvent).toMatchObject({ session_id: sessionId, effort: 'high' });
+
+    await pass.finalize(true);
+
+    const { acquireParseStateLock } = await import('../parse-state.js');
+    const release = await acquireParseStateLock(sessionId); // would hang if the pass's lock leaked
+    await release();
+  });
+
+  it('openMainTranscriptPass omits the agent.session.env record when envCheck finds nothing changed', async () => {
+    const sessionId = 'session-envcheck-stop-unchanged';
+    const transcriptPath = writeTranscript('transcript-envcheck-stop-unchanged.jsonl', [noUsageLine('uuid-main')]);
+
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: sessionEnvFixture.effort,
+      permission_mode: sessionEnvFixture.permission_mode,
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: sessionEnvFixture.timezone,
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+
+    const pass = await openMainTranscriptPass(sessionId, transcriptPath, 'Stop', {
+      effort: sessionEnvFixture.effort,
+      permissionMode: sessionEnvFixture.permission_mode,
+    });
+
+    expect(pass.events.some((e) => e.type === 'agent.session.env')).toBe(false);
+    await pass.finalize(true);
+  });
+
+  it('a hook fire with no envCheck argument (PostCompact-style callers) behaves exactly as before — no agent.session.env ever appended', async () => {
+    const sessionId = 'session-envcheck-omitted';
+    const transcriptPath = writeTranscript('transcript-envcheck-omitted.jsonl', [noUsageLine('uuid-main')]);
+
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    const pass = await openMainTranscriptPass(sessionId, transcriptPath, 'Stop');
+
+    expect(pass.events.some((e) => e.type === 'agent.session.env')).toBe(false);
+    expect(resolveVolatileSessionEnvFieldsMock).not.toHaveBeenCalled();
+    await pass.finalize(true);
+  });
+
+  it('openSubagentPass folds envCheck into its own already-held lock and appends the changed record', async () => {
+    const sessionId = 'session-envcheck-subagent';
+    const file = writeSubagentFixture(sessionId, 'a1', [
+      usageLine({ uuid: 'u1', messageId: 'msg_a', outputTokens: 10 }),
+    ]);
+
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: 'high',
+      permission_mode: sessionEnvFixture.permission_mode,
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: sessionEnvFixture.timezone,
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+
+    const started = Date.now();
+    const pass = await openSubagentPass(sessionId, file, {
+      effort: 'high',
+      permissionMode: sessionEnvFixture.permission_mode,
+    });
+    const elapsedMs = Date.now() - started;
+
+    expect(elapsedMs).toBeLessThan(2_000);
+    expect(pass.events.find((e) => e.type === 'agent.session.env')).toMatchObject({ effort: 'high' });
+    await pass.finalize(true);
+  });
+
+  it('openSessionEndPass folds envCheck into its own already-held lock and appends the changed record', async () => {
+    const sessionId = 'session-envcheck-sessionend';
+    const transcriptPath = writeTranscript('transcript-envcheck-sessionend.jsonl', [noUsageLine('uuid-main')]);
+
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: 'high',
+      permission_mode: sessionEnvFixture.permission_mode,
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: sessionEnvFixture.timezone,
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+
+    const started = Date.now();
+    const pass = await openSessionEndPass(sessionId, transcriptPath, '/repo', {
+      effort: 'high',
+      permissionMode: sessionEnvFixture.permission_mode,
+    });
+    const elapsedMs = Date.now() - started;
+
+    expect(elapsedMs).toBeLessThan(2_000);
+    expect(pass.events.find((e) => e.type === 'agent.session.env')).toMatchObject({ effort: 'high' });
+    await pass.finalize(true);
+  });
+
+  it('openSessionEndPass with an empty-payload envCheck (SessionEnd never carries effort/permission_mode) appends no agent.session.env record', async () => {
+    const sessionId = 'session-envcheck-sessionend-empty-payload';
+    const transcriptPath = writeTranscript('transcript-envcheck-sessionend-empty-payload.jsonl', [noUsageLine('uuid-main')]);
+
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: '',
+      permission_mode: '',
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: sessionEnvFixture.timezone,
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+
+    const pass = await openSessionEndPass(sessionId, transcriptPath, '/repo', {
+      effort: '',
+      permissionMode: '',
+    });
+
+    expect(pass.events.find((e) => e.type === 'agent.session.env')).toBeUndefined();
+    await pass.finalize(true);
+  });
+
+  it('openSubagentPass with an empty-payload envCheck (SubagentStop may carry neither field) appends no agent.session.env record', async () => {
+    const sessionId = 'session-envcheck-subagent-empty-payload';
+    const file = writeSubagentFixture(sessionId, 'a1', [
+      usageLine({ uuid: 'u1', messageId: 'msg_a', outputTokens: 10 }),
+    ]);
+
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: '',
+      permission_mode: '',
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: sessionEnvFixture.timezone,
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+
+    const pass = await openSubagentPass(sessionId, file, {
+      effort: '',
+      permissionMode: '',
+    });
+
+    expect(pass.events.find((e) => e.type === 'agent.session.env')).toBeUndefined();
+    await pass.finalize(true);
+  });
+
+  it('finalize(false) leaves lastSessionEnvFields untouched, so the next check still sees the old diff (commit-after-send holds for the folded-in check too)', async () => {
+    const sessionId = 'session-envcheck-rejected';
+    const transcriptPath = writeTranscript('transcript-envcheck-rejected.jsonl', [noUsageLine('uuid-main')]);
+
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', sessionEnvFixture);
+    await startPass.finalize(true);
+
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: 'high',
+      permission_mode: sessionEnvFixture.permission_mode,
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: sessionEnvFixture.timezone,
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+
+    const first = await openMainTranscriptPass(sessionId, transcriptPath, 'Stop', {
+      effort: 'high',
+      permissionMode: sessionEnvFixture.permission_mode,
+    });
+    expect(first.events.some((e) => e.type === 'agent.session.env')).toBe(true);
+    await first.finalize(false); // the send failed — nothing committed
+
+    const second = await openMainTranscriptPass(sessionId, transcriptPath, 'Stop', {
+      effort: 'high',
+      permissionMode: sessionEnvFixture.permission_mode,
+    });
+    expect(second.events.some((e) => e.type === 'agent.session.env')).toBe(true); // still a diff
+    await second.finalize(true);
+  });
+
+  it('ignores subagent models in the configured_model fallback until the main transcript provides a model', async () => {
+    const sessionId = 'session-envcheck-model-fallback';
+    const transcriptPath = writeTranscript('transcript-envcheck-model-fallback.jsonl', [
+      usageLine({ uuid: 'u1', messageId: 'msg_a', outputTokens: 10, model: 'claude-opus-5' }),
+    ]);
+    const subagentFile = writeSubagentFixture(sessionId, 'a1', [
+      usageLine({ uuid: 'u2', messageId: 'msg_b', outputTokens: 5, model: 'claude-haiku-4-5-20251001' }),
+    ]);
+
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', { ...sessionEnvFixture, configured_model: '' });
+    await startPass.finalize(true);
+
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: sessionEnvFixture.effort,
+      permission_mode: sessionEnvFixture.permission_mode,
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: sessionEnvFixture.timezone,
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+
+    const subagentPass = await openSubagentPass(sessionId, { ...subagentFile, agentType: 'Explore' }, {
+      effort: sessionEnvFixture.effort,
+      permissionMode: sessionEnvFixture.permission_mode,
+    });
+    expect(subagentPass.events.find((e) => e.type === 'agent.session.env')).toBeUndefined();
+    await subagentPass.finalize(true);
+
+    const pass = await openMainTranscriptPass(sessionId, transcriptPath, 'Stop', {
+      effort: sessionEnvFixture.effort,
+      permissionMode: sessionEnvFixture.permission_mode,
+    });
+
+    expect(pass.events.find((e) => e.type === 'agent.session.env')).toMatchObject({ configured_model: 'claude-opus-5' });
+    await pass.finalize(true);
+
+    // Persisted, so a later check against the same baseline finds no further diff.
+    const next = await openMainTranscriptPass(sessionId, transcriptPath, 'Stop', {
+      effort: sessionEnvFixture.effort,
+      permissionMode: sessionEnvFixture.permission_mode,
+    });
+    expect(next.events.some((e) => e.type === 'agent.session.env')).toBe(false);
+    await next.finalize(true);
+  });
+
+  it('never falls back to the <synthetic> API-error placeholder model for configured_model', async () => {
+    const sessionId = 'session-envcheck-model-fallback-synthetic';
+    const transcriptPath = writeTranscript('transcript-envcheck-model-fallback-synthetic.jsonl', [
+      usageLine({ uuid: 'u1', messageId: 'msg_a', outputTokens: 0, model: '<synthetic>', isApiErrorMessage: true }),
+    ]);
+
+    const startPass = await openSessionStartPass(sessionId, 'sha-1', { ...sessionEnvFixture, configured_model: '' });
+    await startPass.finalize(true);
+
+    resolveVolatileSessionEnvFieldsMock.mockResolvedValue({
+      effort: 'high', // force a genuine change so an env event is actually emitted to inspect
+      permission_mode: sessionEnvFixture.permission_mode,
+      os: sessionEnvFixture.os,
+      arch: sessionEnvFixture.arch,
+      node_version: sessionEnvFixture.node_version,
+      timezone: sessionEnvFixture.timezone,
+      hostname_hash: sessionEnvFixture.hostname_hash,
+    });
+
+    const pass = await openMainTranscriptPass(sessionId, transcriptPath, 'Stop', {
+      effort: 'high',
+      permissionMode: sessionEnvFixture.permission_mode,
+    });
+
+    expect(pass.events.find((e) => e.type === 'agent.session.env')).toMatchObject({ configured_model: '' });
+    await pass.finalize(true);
   });
 });
