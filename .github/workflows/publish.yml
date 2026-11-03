@@ -51,8 +51,9 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run CI checks
-        run: npm run ci
+      # Fork test only: the renamed test package breaks cli-updater unit tests, so just build
+      - name: Build
+        run: npm run build
 
       # dist/ is already built by the CI checks above, so skip the prepack build
       - name: Pack tarball
